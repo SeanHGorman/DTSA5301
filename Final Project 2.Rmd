@@ -1,0 +1,382 @@
+---
+title: "Final Project 2 - COVID19 Analysis"
+author: "SG"
+date: "2026-02-16"
+output: html_document
+---
+
+## Overview 
+
+This report analyzes global COVID-19 time series data from the Johns Hopkins University (JHU) CSSE repository, including cumulative confirmed cases and deaths by country over time.
+
+Following the approach used in the course lectures, the analysis emphasizes cross-country comparisons outside the United States, with additional focus on Canada due to its local relevance. Differences in testing practices and reporting standards motivate the use of per-capita measures and a discussion of potential bias in interpretation.
+
+
+## Setup
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(zoo)          # rolling averages
+library(WDI)          # World Bank population (reproducible API)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(mgcv)         # GAM modeling
+library(MASS)   # negative binomial helpers (sometimes used internally)
+library(dplyr)
+```
+
+
+```{r get_jhu_data, message = FALSE}
+url_in <- "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/"
+file_names <- c("time_series_covid19_confirmed_global.csv",
+                "time_series_covid19_deaths_global.csv")
+urls <- str_c(url_in,file_names)
+```
+
+```{r import_data, message = FALSE}
+global_cases_raw  <- read_csv(urls[1])
+global_deaths_raw <- read_csv(urls[2])
+```
+
+
+## Tidy + combined cases & deaths
+
+JHU global files can contain multiple rows per country (e.g., provinces/states). We aggregate to country totals per day and then derive daily new cases/deaths from cumulative totals.
+
+
+```{r tidy_global}
+# Cases
+global_cases <- global_cases_raw %>%
+  dplyr::select(-c(`Province/State`, Lat, Long)) %>%
+  pivot_longer(
+    cols = -`Country/Region`,
+    names_to = "date",
+    values_to = "cases"
+  ) %>%
+  rename(Country_Region = `Country/Region`) %>%
+  mutate(date = mdy(date)) %>%
+  group_by(Country_Region, date) %>%
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop")
+
+# Deaths
+global_deaths <- global_deaths_raw %>%
+  dplyr::select(-c(`Province/State`, Lat, Long)) %>%
+  pivot_longer(
+    cols = -`Country/Region`,
+    names_to = "date",
+    values_to = "deaths"
+  ) %>%
+  rename(Country_Region = `Country/Region`) %>%
+  mutate(date = mdy(date)) %>%
+  group_by(Country_Region, date) %>%
+  summarise(deaths = sum(deaths, na.rm = TRUE), .groups = "drop")
+
+# Join + compute daily increments
+global <- global_cases %>%
+  full_join(global_deaths, by = c("Country_Region", "date")) %>%
+  arrange(Country_Region, date) %>%
+  group_by(Country_Region) %>%
+  mutate(
+    new_cases  = cases  - lag(cases, default = 0),
+    new_deaths = deaths - lag(deaths, default = 0),
+    # Backfills/revisions can cause negative daily deltas
+    new_cases  = if_else(new_cases < 0, NA_real_, new_cases),
+    new_deaths = if_else(new_deaths < 0, NA_real_, new_deaths),
+    # Smooth for plotting
+    new_cases_7d  = zoo::rollmean(new_cases,  7, fill = NA, align = "right"),
+    new_deaths_7d = zoo::rollmean(new_deaths, 7, fill = NA, align = "right")
+  ) %>%
+  ungroup()
+
+rm(global_cases_raw, global_deaths_raw, global_cases, global_deaths)
+
+```
+
+## Add population data (World Bank) and per-capita rates
+
+We join country population from the World Bank API (WDI package).
+We use 2020 population as a stable baseline for per-capita comparisons.
+
+
+```{r add_population}
+# Pulling population data 
+pop_raw <- WDI(
+  country = "all",
+  indicator = c(pop = "SP.POP.TOTL"),
+  start = 2020,
+  end = 2020
+)
+
+pop <- pop_raw %>%
+  filter(!is.na(pop)) %>%
+  dplyr::select(iso3c, country, pop) %>%
+  rename(Country_Region = country)
+
+global_pc <- global %>%
+  left_join(pop, by = "Country_Region") %>%
+  mutate(
+    cases_per_100k        = (cases / pop) * 1e5,
+    deaths_per_100k       = (deaths / pop) * 1e5,
+    new_cases_per_100k    = (new_cases / pop) * 1e5,
+    new_deaths_per_100k   = (new_deaths / pop) * 1e5,
+    new_cases_per_100k_7d = (new_cases_7d / pop) * 1e5,
+    new_deaths_per_100k_7d= (new_deaths_7d / pop) * 1e5
+  )
+
+# Quick check (kept silent in the rendered report)
+invisible(
+  global_pc %>%
+    filter(Country_Region == "Canada") %>%
+    summarise(
+      start = min(date),
+      end = max(date),
+      last_cases = max(cases, na.rm = TRUE),
+      last_deaths = max(deaths, na.rm = TRUE)
+    )
+)
+
+
+```
+
+## Visualization 1: Canada vs G7 waves (daily new cases per 100k, 7-day avg)
+
+```{r Visualization_1}
+
+g7 <- c("Canada","United States","United Kingdom","France","Germany","Italy","Japan")
+
+g7_daily <- global_pc %>%
+  dplyr::filter(Country_Region %in% g7) %>%
+  dplyr::select(Country_Region, date, new_cases_per_100k_7d)
+
+ggplot(g7_daily, aes(x = date, y = new_cases_per_100k_7d)) +
+  geom_line() +
+  facet_wrap(~ Country_Region, scales = "fixed") +
+  labs(
+    title = "COVID-19 Waves in the G7",
+    subtitle = "Daily new confirmed cases per 100k (7-day average); panels use free y-scales",
+    x = "Date",
+    y = "New cases per 100k (7-day avg)"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation**: 
+
+A 7-day average reduces reporting noise and makes wave structure visible. Differences between countries reflect not only disease dynamics but also changes in testing, reporting policy, and variant timing.
+Canada experienced multiple waves with timing similar to its peers, but the overall peak intensity of daily confirmed cases per capita appears lower than in much of Europe. Japan shows a delayed pattern of large waves, with major surges occurring later in the pandemic period.
+
+Using a fixed scale highlights that cross-country differences are not only about wave timing, but also about the relative severity of outbreaks as measured through reported confirmed infections. However, these differences may also reflect variation in testing capacity and reporting practices rather than purely epidemiological factors.
+
+
+## Visualization 2: Global Map of Cumulative Cases per 100k
+
+```{r Visualization_2}
+end_date <- max(global_pc$date, na.rm = TRUE)
+
+latest <- global_pc %>%
+  dplyr::filter(date == end_date) %>%
+  dplyr::select(iso3c, Country_Region, cases_per_100k, deaths_per_100k)
+
+world <- ne_countries(scale = "medium", returnclass = "sf") %>%
+  left_join(latest, by = c("iso_a3" = "iso3c"))
+
+ggplot(world) +
+  geom_sf(aes(fill = cases_per_100k), color = NA) +
+  scale_fill_viridis_c(option = "C", na.value = "grey90") +
+  labs(
+    title = paste0("Cumulative Confirmed COVID-19 Cases per 100k (", end_date, ")"),
+    subtitle = "JHU CSSE confirmed cases + World Bank population (2020 baseline)",
+    fill = "Cases\nper 100k"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation**: The choropleth map shows substantial geographic variation in cumulative confirmed cases per 100,000 population. Europe, North America, Australia, and parts of South America exhibit higher cumulative case rates relative to much of Africa and parts of Asia.
+
+However, this map must be interpreted cautiously. Confirmed cases depend heavily on testing availability and reporting infrastructure. Regions with lower reported case rates may reflect limited testing rather than lower true infection burden. High-income countries tend to report higher per-capita confirmed case rates, likely due in part to more widespread testing and reporting systems.
+
+
+## Visualization 3: Top 20 Countries by Cumulative Deaths per 100k
+
+```{r viz_top20_deaths}
+end_date <- max(global_pc$date, na.rm = TRUE)
+
+top_deaths <- global_pc %>%
+  dplyr::filter(date == end_date, !is.na(pop)) %>%
+  dplyr::mutate(deaths_per_100k = (deaths / pop) * 1e5) %>%
+  dplyr::arrange(dplyr::desc(deaths_per_100k)) %>%
+  dplyr::slice_head(n = 20) %>%
+  dplyr::mutate(Country_Region = forcats::fct_reorder(Country_Region, deaths_per_100k))
+
+ggplot(top_deaths, aes(x = Country_Region, y = deaths_per_100k)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = paste0("Top 20 Countries by Cumulative Deaths per 100k (", end_date, ")"),
+    subtitle = "Per-capita scaling uses World Bank population (2020 baseline)",
+    x = NULL,
+    y = "Deaths per 100k"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation**: The top 20 countries by cumulative deaths per 100,000 are concentrated primarily in Eastern Europe and parts of South America. Peru stands out with the highest per-capita death rate in this ranking.
+
+Many countries in this list are middle-income European nations, which may reflect a combination of healthcare capacity constraints, population age structure, vaccination timing, and reporting standards.Importantly, per-capita death rates are generally considered more reliable than case counts for cross-country comparison, but they are still influenced by differences in cause-of-death attribution and reporting practices.
+
+
+## Visualization 4: G7 Daily Deaths
+
+```{r viz_g7_deaths}
+g7 <- c("Canada","United States","United Kingdom","France","Germany","Italy","Japan")
+
+g7_deaths <- global_pc %>%
+  dplyr::filter(Country_Region %in% g7) %>%
+  dplyr::arrange(Country_Region, date) %>%
+  dplyr::mutate(new_deaths_per_100k_7d = zoo::rollmean(new_deaths_per_100k, 7, fill = NA, align = "right"))
+
+ggplot(g7_deaths, aes(x = date, y = new_deaths_per_100k_7d)) +
+  geom_line() +
+  facet_wrap(~ Country_Region, scales = "fixed") +
+  labs(
+    title = "G7: Daily New Deaths per 100k (7-day Average)",
+    subtitle = "Panels use free y-scales; Canada shown alongside peers",
+    x = "Date",
+    y = "New deaths per 100k (7-day avg)"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation**: Later waves, particularly after 2021, show much smaller mortality peaks relative to case surges, suggesting reduced fatality risk over time due to vaccination, improved medical response, and potentially changes in variant severity.
+
+Canada’s mortality trajectory closely follows the overall G7 pattern but generally remains below the highest peaks observed in parts of Europe. Japan exhibits consistently lower death rates per capita throughout much of the pandemic period.
+Overall, the shared scale reinforces that while COVID-19 waves occurred globally, the per-capita mortality impact differed substantially across countries.
+
+## Visualization 5: Cases vs Deaths (Log-Log Scatter)
+
+```{r viz_scatter_latest}
+end_date <- max(global_pc$date, na.rm = TRUE)
+
+latest_scatter <- global_pc %>%
+  dplyr::filter(date == end_date, !is.na(pop)) %>%
+  dplyr::mutate(
+    cases_per_100k  = (cases / pop) * 1e5,
+    deaths_per_100k = (deaths / pop) * 1e5
+  ) %>%
+  dplyr::filter(is.finite(cases_per_100k), is.finite(deaths_per_100k)) %>%
+  dplyr::mutate(is_canada = Country_Region == "Canada")
+
+ggplot(latest_scatter, aes(x = cases_per_100k, y = deaths_per_100k)) +
+  geom_point(alpha = 0.4) +
+  geom_point(
+    data = dplyr::filter(latest_scatter, is_canada),
+    size = 3
+  ) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(
+    title = paste0("Relationship Between Cumulative Cases and Deaths per 100k (", end_date, ")"),
+    subtitle = "Log scales; Canada highlighted. Interpretation limited by reporting/testing differences.",
+    x = "Cases per 100k (log10)",
+    y = "Deaths per 100k (log10)"
+  ) +
+  theme_minimal()
+```
+
+
+**Interpretation**: The log–log scatter plot shows a strong positive relationship between cumulative confirmed cases per 100,000 and cumulative deaths per 100,000. Countries with higher case rates generally exhibit higher death rates, consistent with expected epidemiological dynamics.
+
+The approximately linear pattern on log scales suggests a roughly proportional relationship across countries. However, substantial dispersion around the trend line indicates heterogeneity in case fatality rates, age structure, healthcare capacity, vaccination coverage, and reporting systems.Canada lies within the main cluster of high-income countries, exhibiting both high cumulative case rates and moderate-to-high death rates relative to global averages.
+
+
+## Model - Canada Daily Deaths
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r model}
+
+canada <- global_pc %>%
+  filter(Country_Region == "Canada") %>%
+  arrange(date) %>%
+  mutate(
+    t = as.numeric(date - min(date)),
+    log_deaths = log(new_deaths + 1)
+  ) %>%
+  filter(!is.na(new_deaths), new_deaths >= 0)
+
+m_lm <- lm(log_deaths ~ poly(t, 6), data = canada)
+summary(m_lm)
+
+```
+
+```{r canada_fit}
+canada_fit <- canada %>%
+  mutate(
+    fitted_log = predict(m_lm),
+    fitted = exp(fitted_log) - 1,
+    obs_7d = zoo::rollmean(new_deaths, 7, fill = NA, align = "right"),
+    fit_7d = zoo::rollmean(fitted, 7, fill = NA, align = "right")
+  )
+
+ggplot(canada_fit, aes(x = date)) +
+  geom_line(aes(y = obs_7d), alpha = 0.7) +
+  geom_line(aes(y = fit_7d), linetype = "dashed") +
+  labs(
+    title = "Canada: Daily COVID-19 Deaths (7-day avg) vs Polynomial Fit",
+    subtitle = "Model: lm(log(daily deaths + 1) ~ poly(time, 6))",
+    x = "Date",
+    y = "Daily deaths (7-day avg)"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation**: The polynomial time model captures broad changes in Canada’s daily COVID-19 deaths across the pandemic period. The fitted curve smooths over short-term fluctuations while reflecting major wave periods, including the large early-2020 wave and subsequent surges in 2021 and early 2022.
+
+However, the model does not explicitly incorporate vaccination rollout, variant emergence, seasonality, or public health interventions. As such, it should be interpreted as a descriptive time-trend model rather than a causal explanation of mortality patterns.
+
+The divergence between the fitted curve and observed peaks highlights the complexity of pandemic dynamics and the limitations of purely time-based modeling.
+
+## Bias and Limitations 
+
+- Confirmed cases ≠ true infections. Case counts depend on testing availability, eligibility, and reporting; this produces systematic undercounting, especially early in the pandemic and when rapid tests were common but underreported.
+
+- Comparisons across countries are not apples-to-apples. Different definitions, testing intensity, and reporting systems mean cross-country differences reflect both epidemiology and measurement practices.
+
+- Reporting delays and revisions distort daily changes. Backfills, reclassification, and batch reporting can create spikes or even negative daily deltas (handled here by setting negative daily increments to NA).
+
+- Deaths have definition differences too. Some jurisdictions count deaths “with COVID” vs “from COVID” differently, and cause-of-death attribution varies.
+
+- Per-capita scaling uses a fixed population baseline. Using 2020 population ignores population changes; it improves fairness relative to raw counts but is still approximate.
+
+## Conclusion
+
+Using per-capita normalization, Canada’s COVID-19 time series shows multiple distinct waves consistent with the global pattern seen across G7 countries. The map visualization highlights strong geographic variation, but interpretation is limited by differences in testing and reporting. The fitted time-trend model summarizes broad changes in Canada’s daily deaths across the pandemic period, but it should not be interpreted causally.
+
+
+```{r session_info}
+sessionInfo()
+```
