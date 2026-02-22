@@ -1,0 +1,327 @@
+---
+title: "NYPD Shooting Incident Data Analysis"
+author: "SG"
+date: "2026-02-15"
+output: html_document
+---
+
+
+## Introduction
+
+This report analyzes NYPD Shooting Incident data covering incidents from **Jan 1, 2006 to Dec 31, 2024**.
+The data used in this report is stored in my GitHub repository and is loaded directly from the raw CSV URL
+to ensure the analysis is reproducible.
+
+Data sources (raw CSV):
+
+- Incidents: https://raw.githubusercontent.com/SeanHGorman/DTSA5301/refs/heads/main/NYPD_Shootings_20260214.csv
+
+
+<small>
+> *Note: The publisher structure changed during the time this report was authored: offender and victim information was separated into additional files. This report focuses primarily on incident-level trends, and uses the incident table as the core dataset.*
+
+</small>
+<br>
+
+## Setup and packages
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r load_libraries, echo = TRUE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(janitor)
+library(forcats)
+library(sf)
+library(ggspatial)
+library(spdep)
+library(units)
+library(scales)
+```
+
+
+### Data Import
+```{r data_import}
+inc_url <- "https://raw.githubusercontent.com/SeanHGorman/DTSA5301/refs/heads/main/NYPD_Shootings_20260214.csv"
+off_url <- "https://raw.githubusercontent.com/SeanHGorman/DTSA5301/refs/heads/main/NYPD_Shooting_Offenders.csv"
+vic_url <- "https://raw.githubusercontent.com/SeanHGorman/DTSA5301/refs/heads/main/NYPD_Shooting_Victims.csv"
+
+inc_raw <- read_csv(inc_url) %>% clean_names()
+off_raw <- read_csv(off_url) %>% clean_names()
+vic_raw <- read_csv(vic_url) %>% clean_names()
+
+```
+
+
+### Initial Summary
+``` {r initial_summary}
+glimpse(inc_raw)
+summary(inc_raw)
+```
+
+## Tidy and Transform Data 
+
+### Remove redundant/unused columns
+This analysis uses latitude/longitude for mapping, so the alternative coordinate columns are removed.
+The incident key is a unique identifier and not needed for summary-level analysis.
+
+``` {r}
+inc <- inc_raw %>%
+  select(-incident_key, -x_coord_cd, -y_coord_cd)
+```
+
+### Convert types (dates + factors)
+```{r convert_types}
+inc <- inc %>%
+  mutate(
+    occur_date = mdy(occur_date),
+    occur_year = year(occur_date),
+    occur_month_num = month(occur_date),             # 1-12 for seasonality
+    boro = as.factor(boro),
+    precinct = as.factor(precinct)
+  ) %>%
+  arrange(occur_date)
+```
+
+### Missing data handling
+- Latitude/longitude: rows missing coordinates cannot be mapped reliably, so they are removed.
+- location_desc: if this field is heavily missing and not central to the analysis, it is dropped.
+
+
+### Missing data check (after handling)
+``` {r missing_check}
+missing_after <- inc %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "missing") %>%
+  arrange(desc(missing))
+
+missing_after
+summary(inc)
+```
+
+<br>
+## Exploratory Analysis and Visualizations
+
+### Visualization 1: Yearly Trend
+
+``` {r year_trend}
+year_counts <- inc %>% count(occur_year)
+
+ggplot(year_counts, aes(x = occur_year, y = n)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  scale_x_continuous(breaks = seq(min(year_counts$occur_year),
+                                  max(year_counts$occur_year),
+                                  by = 2)) +
+  labs(
+    title = "NYPD Shooting Incidents by Year",
+    x = "Year",
+    y = "Number of Incidents"
+  ) +
+  theme_minimal()
+```
+
+
+**Interpretation**: Incidents generally decline from 2006 through 2019, then rise sharply around 2020–2021 and decline afterward.
+A reasonable follow-up question is whether the increase is concentrated in specific boroughs or precincts.
+
+### Visualization 2: Seasonality (month-of-year)
+
+```{r seasonality_plot}
+
+monthly_counts <- inc %>% count(occur_month_num)
+
+ggplot(monthly_counts, aes(x = occur_month_num, y = n)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5, alpha = 0.7) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    title = "Seasonality of NYPD Shooting Incidents (Month of Year)",
+    x = "Month (1 = Jan ... 12 = Dec)",
+    y = "Number of Incidents"
+  ) +
+  theme_minimal()
+```
+
+**Interpretation**: Incidents peak in warmer months (commonly around June–August).
+Follow-up question: is the seasonal pattern consistent across boroughs?
+
+### Visualization 3: Borough Trends over time 
+```{r borough_trends}
+
+boro_year <- inc %>% count(occur_year, boro)
+
+ggplot(boro_year, aes(x = occur_year, y = n, group = boro, color = boro)) +
+  geom_line(linewidth = 1, alpha = 0.9) +
+  labs(
+    title = "Shooting Incidents by Year and Borough",
+    x = "Year",
+    y = "Incidents",
+    color = "Borough"
+  ) +
+  theme_minimal()
+```
+
+
+
+
+
+
+``` {r}
+boro_counts <- inc %>% count(boro, sort = TRUE)
+
+ggplot(boro_counts, aes(x = reorder(boro, n), y = n, fill = boro)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Total Shooting Incidents by Borough (2006–2024)",
+    x = "Borough",
+    y = "Number of Incidents"
+  ) +
+  guides(fill = "none") +
+  theme_minimal()
+
+inc_geo <- inc %>%
+  filter(
+    between(longitude, -74.3, -73.7),
+    between(latitude, 40.5, 40.95)
+  )
+```
+
+
+```{r 2019_2020_changes}
+inc %>%
+  filter(occur_year %in% c(2019, 2020)) %>%
+  count(occur_year, boro) %>%
+  group_by(boro) %>%
+  mutate(pct_change = (n - lag(n)) / lag(n) * 100)
+```
+
+
+
+
+```{r}
+inc_sf <- st_as_sf(inc_geo, coords = c("longitude", "latitude"), crs = 4326)
+options(ggspatial.progress = FALSE)
+ggplot() +
+  annotation_map_tile(type = "cartolight", zoom = 11) +
+  geom_sf(data = inc_sf, aes(color = boro), alpha = 0.25, size = 0.5) +
+  labs(title = "Shooting Incidents Across NYC", color = "Borough") +
+  theme_minimal()
+```
+
+**Interpretation**:While Brooklyn exhibits the highest number of incidents, it also shows the greatest year-to-year variability. However, this variation appears proportional to total incident volume rather than representing instability unique to the borough. Smaller boroughs such as Staten Island show lower variability, likely due to lower baseline counts.
+
+
+
+```{r borough_rate_per_capita}
+
+## From US Census Bureau (2020). 2020 Decennial Census (data.census.gov). Could not be directly queried in this report due to firewall issues, so I've hardcoded it here. 
+
+boro_pop <- tibble::tribble(
+  ~boro,           ~population_2020,
+  "BRONX",         1472654,
+  "BROOKLYN",      2736074,
+  "MANHATTAN",     1694251,
+  "QUEENS",        2405464,
+  "STATEN ISLAND",  495747
+)
+
+# Total incidents per borough
+boro_totals <- inc %>%
+  filter(!is.na(boro)) %>%
+  count(boro, name = "incidents")
+
+# Join population and compute per-capita rate
+boro_rates <- boro_totals %>%
+  left_join(boro_pop, by = "boro") %>%
+  mutate(
+    incidents_per_100k = incidents / population_2020 * 100000
+  ) %>%
+  arrange(desc(incidents_per_100k))
+
+boro_rates
+
+ggplot(boro_rates, aes(x = reorder(boro, incidents_per_100k), y = incidents_per_100k, fill = boro)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Shooting Incidents per 100,000 Residents by Borough (2006–2024)",
+    subtitle = "Normalization using approximate 2020 borough populations",
+    x = "Borough",
+    y = "Incidents per 100,000 residents"
+  ) +
+  guides(fill = "none") +
+  theme_minimal()
+```
+
+
+```{r borough_raw_vs_rate}
+boro_compare <- boro_rates %>%
+  select(boro, incidents, incidents_per_100k) %>%
+  pivot_longer(cols = c(incidents, incidents_per_100k),
+               names_to = "metric",
+               values_to = "value") %>%
+  mutate(metric = recode(metric,
+                         incidents = "Total incidents (raw)",
+                         incidents_per_100k = "Incidents per 100k (normalized)"))
+
+ggplot(boro_compare, aes(x = reorder(boro, value), y = value, fill = boro)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~metric, scales = "free_x") +
+  labs(
+    title = "Raw Counts vs Normalized Shooting Incident Rates by Borough",
+    x = "Borough",
+    y = NULL
+  ) +
+  guides(fill = "none") +
+  theme_minimal()
+```
+
+**Interpretation**: In raw totals, Brooklyn has the most shootings, which makes sense given its population. But when we adjust for population size, the Bronx actually has the highest rate per 100,000 residents. This shows why normalization matters — it helps distinguish between volume and relative concentration. 
+
+## Conclusion and Bias
+
+### Conclusion
+
+From 2006–2019, shooting incidents generally decreased, followed by a notable increase around 2020–2021 and a decline in later years.
+Incidents also show strong seasonality, with higher counts during warmer months. A borough-level breakdown helps identify whether
+the 2020–2021 increase was concentrated in particular areas, motivating further analysis at the precinct level.
+
+### Sources of bias and limitations
+
+Reporting/recording bias: incidents reflect what is reported and recorded by NYPD, not necessarily all incidents that occurred.
+
+Geographic filtering bias: removing rows with missing or invalid coordinates improves mapping, but may disproportionately exclude certain records.
+
+Time/coverage bias: the dataset structure changed over time (incidents split from victim/offender tables), which can affect what analyses are possible. As noted earlier, further analysis is recommended using these additional datasets
+
+A potential personal bias is assuming that major external events (e.g., COVID-era disruption) caused changes seen in the trend.
+To mitigate this, this report limits claims to observed patterns in the data and frames external explanations as hypotheses that
+require additional evidence (e.g., comparing with policing policies, demographic data, or economic indicators).
+
+#### Related Datasets
+- Offenders: https://raw.githubusercontent.com/SeanHGorman/DTSA5301/refs/heads/main/NYPD_Shooting_Offenders.csv
+
+- Victims: https://raw.githubusercontent.com/SeanHGorman/DTSA5301/refs/heads/main/NYPD_Shooting_Victims.csv
+
+
+```{r session_info}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
